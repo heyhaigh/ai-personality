@@ -1,0 +1,26 @@
+{
+  "name": "hume-claude-proxy",
+  "version": "1.0.0",
+  "description": "Custom Language Model proxy for Hume AI that forwards to Claude with custom prompting",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "hume",
+    "claude",
+    "proxy",
+    "llm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-fetch": "^2.7.0"
+  }
+}
