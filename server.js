@@ -1,4 +1,6 @@
 import express from 'express';
+import { WebSocketServer } from 'ws';
+import { createServer } from 'http';
 import Anthropic from '@anthropic-ai/sdk';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -131,161 +133,141 @@ Remember: You're Ryan having a real conversation. Be yourself - curious, friendl
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'hume-claude-proxy' });
+  res.json({ status: 'healthy', service: 'hume-claude-proxy-websocket' });
 });
 
-// Main chat completions endpoint for Hume integration
-app.post('/chat/completions', async (req, res) => {
-  try {
-    const { messages, stream = true, model = 'claude-haiku-4-5' } = req.body;
+// Create HTTP server
+const server = createServer(app);
 
-    console.log('Received request:', {
-      messageCount: messages?.length,
-      stream,
-      model
+// Create WebSocket server for the /llm endpoint
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+
+  if (pathname === '/llm') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
     });
-
-    // Set headers for Server-Sent Events
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    // Extract messages from request and prepare for Claude
-    // Hume sends messages in OpenAI format: { role: 'user'|'assistant'|'system', content: 'text' }
-    const claudeMessages = [];
-    let systemPrompt = CUSTOM_SYSTEM_PROMPT;
-
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        // Append any system messages from Hume to our custom prompt
-        systemPrompt += `\n\n${msg.content}`;
-      } else if (msg.role === 'user' || msg.role === 'assistant') {
-        claudeMessages.push({
-          role: msg.role,
-          content: msg.content
-        });
-      }
-    }
-
-    console.log('Forwarding to Claude:', {
-      messageCount: claudeMessages.length,
-      systemPromptLength: systemPrompt.length
-    });
-
-    // Create Claude streaming request
-    const stream_response = await anthropic.messages.stream({
-      model: model,
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: claudeMessages,
-    });
-
-    // Track the message for creating OpenAI-compatible response
-    let fullContent = '';
-    let messageId = `chatcmpl-${Date.now()}`;
-    let created = Math.floor(Date.now() / 1000);
-
-    // Send initial chunk
-    const initialChunk = {
-      id: messageId,
-      object: 'chat.completion.chunk',
-      created: created,
-      model: model,
-      choices: [{
-        index: 0,
-        delta: { role: 'assistant', content: '' },
-        finish_reason: null
-      }]
-    };
-    res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
-
-    // Stream Claude's response and convert to OpenAI format
-    stream_response.on('text', (text, snapshot) => {
-      fullContent += text;
-
-      const chunk = {
-        id: messageId,
-        object: 'chat.completion.chunk',
-        created: created,
-        model: model,
-        choices: [{
-          index: 0,
-          delta: { content: text },
-          finish_reason: null
-        }]
-      };
-
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      }
-    });
-
-    stream_response.on('error', (error) => {
-      console.error('Claude stream error:', error);
-      if (!res.writableEnded) {
-        res.write(`data: {"error": "${error.message}"}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    });
-
-    // When stream is done
-    try {
-      await stream_response.finalMessage();
-
-      // Send final chunk with finish_reason
-      if (!res.writableEnded) {
-        const finalChunk = {
-          id: messageId,
-          object: 'chat.completion.chunk',
-          created: created,
-          model: model,
-          choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: 'stop'
-          }]
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-
-      console.log('Stream completed successfully');
-    } catch (streamError) {
-      console.error('Stream error:', streamError);
-      if (!res.writableEnded) {
-        res.write(`data: {"error": "${streamError.message}"}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    }
-
-  } catch (error) {
-    console.error('Error in /chat/completions:', error);
-
-    // If headers not sent yet, send error as JSON
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: 'server_error'
-        }
-      });
-    } else {
-      // If streaming already started, send error event and close
-      res.write(`data: {"error": "${error.message}"}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    }
+  } else {
+    socket.destroy();
   }
 });
 
+wss.on('connection', async (ws) => {
+  console.log('WebSocket client connected to /llm');
+
+  ws.on('message', async (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      console.log('Received message:', {
+        messageCount: message.messages?.length,
+        model: message.model
+      });
+
+      // Extract messages and prepare for Claude
+      const claudeMessages = [];
+      let systemPrompt = CUSTOM_SYSTEM_PROMPT;
+
+      for (const msg of message.messages || []) {
+        if (msg.role === 'system') {
+          systemPrompt += `\n\n${msg.content}`;
+        } else if (msg.role === 'user' || msg.role === 'assistant') {
+          claudeMessages.push({
+            role: msg.role,
+            content: msg.content
+          });
+        }
+      }
+
+      console.log('Forwarding to Claude:', {
+        messageCount: claudeMessages.length,
+        systemPromptLength: systemPrompt.length
+      });
+
+      // Create Claude streaming request
+      const model = message.model || 'claude-haiku-4-5';
+
+      try {
+        const stream = await anthropic.messages.stream({
+          model: model,
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages: claudeMessages,
+        });
+
+        // Stream Claude's response back through WebSocket
+        stream.on('text', (text) => {
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'text',
+              content: text
+            }));
+          }
+        });
+
+        stream.on('error', (error) => {
+          console.error('Claude stream error:', error);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: error.message
+            }));
+          }
+        });
+
+        // When stream is complete
+        try {
+          await stream.finalMessage();
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'done'
+            }));
+          }
+          console.log('Stream completed successfully');
+        } catch (streamError) {
+          console.error('Stream finalization error:', streamError);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: streamError.message
+            }));
+          }
+        }
+      } catch (streamError) {
+        console.error('Error creating stream:', streamError);
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            error: streamError.message
+          }));
+        }
+      }
+    } catch (error) {
+      console.error('Error processing message:', error);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: error.message
+        }));
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket client disconnected');
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
 // Start server
-app.listen(PORT, () => {
-  console.log(`\n🚀 Hume-Claude Proxy Server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`\n🚀 Hume-Claude Proxy Server (WebSocket) running on port ${PORT}`);
   console.log(`\nEndpoints:`);
-  console.log(`  - POST http://localhost:${PORT}/chat/completions (for Hume)`);
+  console.log(`  - WS   ws://localhost:${PORT}/llm (for Hume WebSocket)`);
   console.log(`  - GET  http://localhost:${PORT}/health (health check)`);
   console.log(`\nMake sure to set your ANTHROPIC_API_KEY in .env file\n`);
 });
