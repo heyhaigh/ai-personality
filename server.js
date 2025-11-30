@@ -173,8 +173,10 @@ app.post('/chat/completions', async (req, res) => {
     });
 
     // Create Claude streaming request
+    // Always use a valid Claude model name, ignoring whatever Hume sends
+    const validClaudeModel = 'claude-haiku-4-5';
     const stream_response = await anthropic.messages.stream({
-      model: model,
+      model: validClaudeModel,
       max_tokens: 1024,
       system: systemPrompt,
       messages: claudeMessages,
@@ -190,7 +192,7 @@ app.post('/chat/completions', async (req, res) => {
       id: messageId,
       object: 'chat.completion.chunk',
       created: created,
-      model: model,
+      model: validClaudeModel,
       choices: [{
         index: 0,
         delta: { role: 'assistant', content: '' },
@@ -207,7 +209,7 @@ app.post('/chat/completions', async (req, res) => {
         id: messageId,
         object: 'chat.completion.chunk',
         created: created,
-        model: model,
+        model: validClaudeModel,
         choices: [{
           index: 0,
           delta: { content: text },
@@ -239,7 +241,7 @@ app.post('/chat/completions', async (req, res) => {
           id: messageId,
           object: 'chat.completion.chunk',
           created: created,
-          model: model,
+          model: validClaudeModel,
           choices: [{
             index: 0,
             delta: {},
