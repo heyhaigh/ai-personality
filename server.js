@@ -245,7 +245,7 @@ app.post('/chat/completions', async (req, res) => {
     const validClaudeModel = 'claude-haiku-4-5';
     const stream_response = await anthropic.messages.stream({
       model: validClaudeModel,
-      max_tokens: 4096,  // Increased from 1024 to allow longer voice conversations (~15-20 min)
+      max_tokens: 1000,  // ~4 min of speaking per response, Hume's 240s session timeout handles ending the call
       system: systemPrompt,
       messages: claudeMessages,
     });
