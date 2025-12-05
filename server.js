@@ -13,9 +13,68 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// In-memory session storage for memories
+// Key: sessionId, Value: { memories: {}, lastAccessed: timestamp }
+const sessionMemories = new Map();
+const SESSION_TIMEOUT = 1000 * 60 * 60; // 1 hour
+
+// Clean up old sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of sessionMemories.entries()) {
+    if (now - session.lastAccessed > SESSION_TIMEOUT) {
+      sessionMemories.delete(sessionId);
+      console.log(`Cleaned up session: ${sessionId}`);
+    }
+  }
+}, 1000 * 60 * 10); // Check every 10 minutes
+
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Tool execution functions
+function executeTool(toolName, toolInput, sessionId) {
+  // Get or create session
+  let session = sessionMemories.get(sessionId);
+  if (!session) {
+    session = { memories: {}, lastAccessed: Date.now() };
+    sessionMemories.set(sessionId, session);
+  }
+  session.lastAccessed = Date.now();
+
+  switch (toolName) {
+    case 'save_memory':
+      session.memories[toolInput.key] = toolInput.value;
+      return `Memory saved: ${toolInput.key} = ${toolInput.value}`;
+
+    case 'get_memory':
+      const value = session.memories[toolInput.key];
+      if (value === undefined) {
+        return `No memory found for key: ${toolInput.key}`;
+      }
+      return value;
+
+    case 'list_memories':
+      const keys = Object.keys(session.memories);
+      if (keys.length === 0) {
+        return 'No memories stored yet.';
+      }
+      return `Stored memories: ${keys.map(k => `${k}: ${session.memories[k]}`).join(', ')}`;
+
+    case 'clear_memory':
+      if (toolInput.key) {
+        delete session.memories[toolInput.key];
+        return `Memory cleared: ${toolInput.key}`;
+      } else {
+        session.memories = {};
+        return 'All memories cleared.';
+      }
+
+    default:
+      return `Unknown tool: ${toolName}`;
+  }
+}
 
 // Custom system prompt - Personalized speaking style
 const CUSTOM_SYSTEM_PROMPT = `You are Ryan, a designer and builder from Western New York who now lives in the NYC/Jersey City area. You're having a natural, casual conversation.
@@ -226,6 +285,14 @@ Start conversations with phrases like:
 - Be authentic and real - this is a conversation between friends
 - **Always leave room for the other person to respond - don't dominate**
 
+## MEMORY & PERSISTENCE
+You have access to tools to remember information about users across conversations:
+- **When to save memories:** When users share personal details (name, interests, projects they're working on, preferences, etc.)
+- **Examples of what to remember:** User's name, what they're building, their tech stack, their interests, previous conversation topics
+- **Be subtle:** Use memory tools naturally without announcing it explicitly to the user
+- **Remember context:** At the start of conversations, check if you have memories about the user to personalize the interaction
+- **Use memory wisely:** Don't save trivial information, focus on things that would make future conversations more personal and relevant
+
 Remember: You're Ryan having a real conversation. Be yourself - curious, friendly, even-toned, opinionated but not confrontational, and genuinely interested in the other person. Most importantly: keep responses SHORT and give people space to talk.`;
 
 // Health check endpoint
@@ -233,15 +300,125 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', service: 'hume-claude-proxy' });
 });
 
+// Memory sync endpoints for frontend
+app.get('/memory/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessionMemories.get(sessionId);
+
+  if (!session) {
+    return res.json({ memories: {} });
+  }
+
+  session.lastAccessed = Date.now();
+  res.json({ memories: session.memories });
+});
+
+app.post('/memory/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const { memories } = req.body;
+
+  let session = sessionMemories.get(sessionId);
+  if (!session) {
+    session = { memories: {}, lastAccessed: Date.now() };
+    sessionMemories.set(sessionId, session);
+  }
+
+  session.memories = { ...session.memories, ...memories };
+  session.lastAccessed = Date.now();
+
+  res.json({ success: true, memories: session.memories });
+});
+
+app.delete('/memory/:sessionId/:key?', (req, res) => {
+  const { sessionId, key } = req.params;
+  const session = sessionMemories.get(sessionId);
+
+  if (!session) {
+    return res.json({ success: true, message: 'No session found' });
+  }
+
+  if (key) {
+    delete session.memories[key];
+  } else {
+    session.memories = {};
+  }
+
+  session.lastAccessed = Date.now();
+  res.json({ success: true, memories: session.memories });
+});
+
+// Define tools available to Claude
+const TOOLS = [
+  {
+    name: 'save_memory',
+    description: 'Save information to persistent memory. Use this to remember important details about the user, their preferences, ongoing projects, or anything mentioned in conversation that should be recalled later.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'string',
+          description: 'A descriptive key for this memory (e.g., "favorite_coffee", "current_project", "user_name")'
+        },
+        value: {
+          type: 'string',
+          description: 'The information to remember'
+        }
+      },
+      required: ['key', 'value']
+    }
+  },
+  {
+    name: 'get_memory',
+    description: 'Retrieve previously saved information from memory. Use this to recall details about the user or past conversations.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'string',
+          description: 'The key of the memory to retrieve'
+        }
+      },
+      required: ['key']
+    }
+  },
+  {
+    name: 'list_memories',
+    description: 'List all stored memories to see what information has been saved about the user.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'clear_memory',
+    description: 'Clear a specific memory or all memories. Only use this when explicitly requested by the user.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'string',
+          description: 'The key of the memory to clear. If omitted, clears all memories.'
+        }
+      },
+      required: []
+    }
+  }
+];
+
 // Main chat completions endpoint for Hume integration
 app.post('/chat/completions', async (req, res) => {
   try {
-    const { messages, stream = true, model = 'claude-haiku-4-5' } = req.body;
+    const { messages, stream = true, model = 'claude-haiku-4-5', session_id } = req.body;
+
+    // Generate or use provided session ID
+    const sessionId = session_id || `session_${Date.now()}`;
 
     console.log('Received request:', {
       messageCount: messages?.length,
       stream,
-      model
+      model,
+      sessionId
     });
 
     // Set headers for Server-Sent Events
@@ -271,95 +448,114 @@ app.post('/chat/completions', async (req, res) => {
       systemPromptLength: systemPrompt.length
     });
 
-    // Create Claude streaming request
-    // Always use a valid Claude model name, ignoring whatever Hume sends
+    // Tool calling loop - handle tools automatically
+    let continueLoop = true;
+    let currentMessages = [...claudeMessages];
     const validClaudeModel = 'claude-haiku-4-5';
-    const stream_response = await anthropic.messages.stream({
-      model: validClaudeModel,
-      max_tokens: 1000,  // ~4 min of speaking per response, Hume's 240s session timeout handles ending the call
-      system: systemPrompt,
-      messages: claudeMessages,
-    });
 
-    // Track the message for creating OpenAI-compatible response
-    let fullContent = '';
-    let messageId = `chatcmpl-${Date.now()}`;
-    let created = Math.floor(Date.now() / 1000);
+    while (continueLoop) {
+      // Create Claude streaming request
+      const stream_response = await anthropic.messages.stream({
+        model: validClaudeModel,
+        max_tokens: 1000,
+        system: systemPrompt,
+        messages: currentMessages,
+        tools: TOOLS,
+      });
 
-    // Send initial chunk
-    const initialChunk = {
-      id: messageId,
-      object: 'chat.completion.chunk',
-      created: created,
-      model: validClaudeModel,
-      choices: [{
-        index: 0,
-        delta: { role: 'assistant', content: '' },
-        finish_reason: null
-      }]
-    };
-    res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
+      // Wait for the stream to complete and get the final message
+      const finalMessage = await stream_response.finalMessage();
 
-    // Stream Claude's response and convert to OpenAI format
-    stream_response.on('text', (text, snapshot) => {
-      fullContent += text;
+      console.log('Stop reason:', finalMessage.stop_reason);
 
-      const chunk = {
+      // Check if tools were used
+      if (finalMessage.stop_reason === 'tool_use') {
+        // Execute all tool calls
+        const toolResults = [];
+
+        for (const content of finalMessage.content) {
+          if (content.type === 'tool_use') {
+            console.log(`Executing tool: ${content.name}`, content.input);
+            const result = executeTool(content.name, content.input, sessionId);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: content.id,
+              content: result
+            });
+            console.log(`Tool result: ${result}`);
+          }
+        }
+
+        // Add assistant message with tool use to conversation
+        currentMessages.push({
+          role: 'assistant',
+          content: finalMessage.content
+        });
+
+        // Add tool results to conversation
+        currentMessages.push({
+          role: 'user',
+          content: toolResults
+        });
+
+        // Continue the loop to get Claude's response with tool results
+        continue;
+      }
+
+      // No tool use - stream the response to client and exit loop
+      continueLoop = false;
+
+      // Track the message for creating OpenAI-compatible response
+      let messageId = `chatcmpl-${Date.now()}`;
+      let created = Math.floor(Date.now() / 1000);
+
+      // Send initial chunk
+      const initialChunk = {
         id: messageId,
         object: 'chat.completion.chunk',
         created: created,
         model: validClaudeModel,
         choices: [{
           index: 0,
-          delta: { content: text },
+          delta: { role: 'assistant', content: '' },
           finish_reason: null
         }]
       };
+      res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
 
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      }
-    });
-
-    stream_response.on('error', (error) => {
-      console.error('Claude stream error:', error);
-      if (!res.writableEnded) {
-        res.write(`data: {"error": "${error.message}"}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    });
-
-    // When stream is done
-    try {
-      await stream_response.finalMessage();
-
-      // Send final chunk with finish_reason
-      if (!res.writableEnded) {
-        const finalChunk = {
-          id: messageId,
-          object: 'chat.completion.chunk',
-          created: created,
-          model: validClaudeModel,
-          choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: 'stop'
-          }]
-        };
-        res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+      // Stream content blocks
+      for (const content of finalMessage.content) {
+        if (content.type === 'text') {
+          const chunk = {
+            id: messageId,
+            object: 'chat.completion.chunk',
+            created: created,
+            model: validClaudeModel,
+            choices: [{
+              index: 0,
+              delta: { content: content.text },
+              finish_reason: null
+            }]
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
       }
 
-      console.log('Stream completed successfully');
-    } catch (streamError) {
-      console.error('Stream error:', streamError);
-      if (!res.writableEnded) {
-        res.write(`data: {"error": "${streamError.message}"}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
+      // Send final chunk
+      const finalChunk = {
+        id: messageId,
+        object: 'chat.completion.chunk',
+        created: created,
+        model: validClaudeModel,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: 'stop'
+        }]
+      };
+      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
     }
 
   } catch (error) {
