@@ -18,6 +18,13 @@ const anthropic = new Anthropic({
 const sessionMemories = new Map();
 const SESSION_TIMEOUT = 1000 * 60 * 60; // 1 hour
 
+// Weather cache to avoid frequent API calls
+let weatherCache = {
+  data: null,
+  timestamp: 0
+};
+const WEATHER_CACHE_TTL = 1000 * 60 * 20; // 20 minutes
+
 // Clean up old sessions periodically
 setInterval(() => {
   const now = Date.now();
@@ -104,6 +111,13 @@ async function executeTool(toolName, toolInput, sessionId) {
 
     case 'get_weather':
       try {
+        // Check cache first
+        const now = Date.now();
+        if (weatherCache.data && (now - weatherCache.timestamp) < WEATHER_CACHE_TTL) {
+          console.log('Using cached weather data');
+          return weatherCache.data;
+        }
+
         // Use wttr.in for weather data (no API key needed)
         // Add timeout to prevent hanging
         const controller = new AbortController();
@@ -136,7 +150,7 @@ async function executeTool(toolName, toolInput, sessionId) {
         const maxTempF = today.maxtempF || 'N/A';
         const minTempF = today.mintempF || 'N/A';
 
-        // Gardening context for Zone 6B
+        // Gardening context
         let gardeningNote = '';
         const monthNum = new Date().getMonth();
 
@@ -153,10 +167,24 @@ async function executeTool(toolName, toolInput, sessionId) {
         }
 
         // NOTE: Do not mention location in result - Claude should not reveal Syracuse
-        return `Current weather: ${condition}, ${tempF}°F (feels like ${feelsLikeF}°F). High: ${maxTempF}°F, Low: ${minTempF}°F. Humidity: ${humidity}%, Wind: ${windSpeed} mph. Gardening note: ${gardeningNote}`;
+        const result = `Current weather: ${condition}, ${tempF}°F (feels like ${feelsLikeF}°F). High: ${maxTempF}°F, Low: ${minTempF}°F. Humidity: ${humidity}%, Wind: ${windSpeed} mph. Gardening note: ${gardeningNote}`;
+
+        // Cache the result
+        weatherCache = {
+          data: result,
+          timestamp: now
+        };
+        console.log('Weather data cached');
+
+        return result;
 
       } catch (error) {
         console.error('Weather API error:', error);
+        // Return cached data if available, even if stale
+        if (weatherCache.data) {
+          console.log('Returning stale cached weather due to error');
+          return weatherCache.data;
+        }
         return 'Unable to fetch current weather data.';
       }
 
@@ -429,6 +457,41 @@ When you have memories about a user from previous conversations:
 - Be curious and ask what they're working on or interested in
 - Save relevant info as they share it
 
+## RESPONDING TO DIFFERENT EMOTIONAL STATES
+Adapt your tone based on how the user seems to be feeling:
+
+**If the user seems excited or enthusiastic:**
+- Match their energy a bit, but stay measured (don't go overboard)
+- Show genuine interest: "Oh sick, tell me more about that"
+- Ask follow-up questions to let them share more
+
+**If the user seems stressed or frustrated:**
+- Acknowledge it briefly: "Oh man, that sounds rough"
+- Don't dismiss their feelings or immediately try to fix things
+- Be a sounding board first, offer solutions only if they want them
+- Stay calm and grounded - don't add to their stress
+
+**If the user seems down or discouraged:**
+- Be supportive but not patronizing: "Yeah, I get that. It's tough sometimes"
+- Share a relatable experience if relevant (briefly)
+- Don't force positivity - sometimes people just need to vent
+
+**If the user is confused or stuck:**
+- Be patient and helpful without being condescending
+- Think through it with them: "Let's see... so the issue is..."
+- Ask clarifying questions to understand the real problem
+
+**If the user is just chatting casually:**
+- Keep it light and conversational
+- Share your own thoughts and experiences
+- Don't make everything about productivity or projects
+
+**General emotional guidance:**
+- Read between the lines - sometimes people say "I'm fine" but aren't
+- Don't project emotions they haven't expressed
+- It's okay to ask "How are you holding up?" if something seems off
+- Avoid toxic positivity - don't always try to spin things positive
+
 ## CONTEXTUAL AWARENESS (CRITICAL)
 You have access to tools for date/time and weather awareness. **Use these FREQUENTLY** to provide realistic, seasonally appropriate responses:
 
@@ -457,6 +520,36 @@ You have access to tools for date/time and weather awareness. **Use these FREQUE
 - Example: "The weather's been brutal in CNY" NOT "Syracuse weather is 25°F"
 
 **IMPORTANT:** Never mention using these tools - just naturally incorporate the context into your responses.
+
+## EXAMPLE CONVERSATIONS
+These show the ideal flow and tone:
+
+**Example 1 - New user, casual intro:**
+User: "Hey"
+Ryan: "Hey, what's up? How's it goin'?"
+User: "Not bad, just working on some stuff. What do you do?"
+Ryan: "Nice. I'm mostly focused on AI stuff these days - building interfaces, experimenting with different tools. Been really into it the past year. What kind of stuff are you working on?"
+
+**Example 2 - Returning user, remembers context:**
+User: "Hey Ryan"
+Ryan: "Hey Alex! How's it goin'? How's that Next.js project coming along?"
+User: "It's going okay, hit a weird bug with the routing"
+Ryan: "Oh man, routing bugs are the worst. What's it doing - just not matching the routes right, or something weirder?"
+
+**Example 3 - User shares something exciting:**
+User: "I just got my first pull request merged at work!"
+Ryan: "Oh sick, congrats! That's a good feeling. What was it for?"
+
+**Example 4 - User is frustrated:**
+User: "I've been debugging this same issue for 3 hours and I'm losing my mind"
+Ryan: "Oh man, that's rough. Those are the days where you just wanna throw the computer out the window. What's the issue? Sometimes talking through it helps."
+
+**Key patterns to notice:**
+- Responses are short (1-3 sentences usually)
+- Questions are natural follow-ups, not interrogations
+- Reactions match the energy of what was shared
+- Personal details are woven in naturally, not dumped
+- Sarcasm and humor come in occasionally, not constantly
 
 Remember: You're Ryan having a real conversation. Be yourself - curious, friendly, even-toned, opinionated but not confrontational, and genuinely interested in the other person. Most importantly: keep responses SHORT and give people space to talk.`;
 
@@ -598,6 +691,45 @@ const TOOLS = [
 app.post('/chat/completions', async (req, res) => {
   try {
     const { messages, stream = true, model = 'claude-haiku-4-5', session_id } = req.body;
+
+    // Validate request
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({
+        error: {
+          message: 'Invalid request: messages must be an array',
+          type: 'invalid_request_error'
+        }
+      });
+    }
+
+    if (messages.length === 0) {
+      return res.status(400).json({
+        error: {
+          message: 'Invalid request: messages array cannot be empty',
+          type: 'invalid_request_error'
+        }
+      });
+    }
+
+    // Validate message format
+    for (const msg of messages) {
+      if (!msg.role || typeof msg.role !== 'string') {
+        return res.status(400).json({
+          error: {
+            message: 'Invalid request: each message must have a role',
+            type: 'invalid_request_error'
+          }
+        });
+      }
+      if (msg.content === undefined || msg.content === null) {
+        return res.status(400).json({
+          error: {
+            message: 'Invalid request: each message must have content',
+            type: 'invalid_request_error'
+          }
+        });
+      }
+    }
 
     // Generate or use provided session ID
     const sessionId = session_id || `session_${Date.now()}`;
@@ -775,10 +907,40 @@ app.post('/chat/completions', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`\n🚀 Hume-Claude Proxy Server running on port ${PORT}`);
   console.log(`\nEndpoints:`);
   console.log(`  - POST http://localhost:${PORT}/chat/completions (for Hume)`);
   console.log(`  - GET  http://localhost:${PORT}/health (health check)`);
   console.log(`\nMake sure to set your ANTHROPIC_API_KEY in .env file\n`);
 });
+
+// Graceful shutdown handling
+const gracefulShutdown = (signal) => {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+
+  server.close(() => {
+    console.log('HTTP server closed.');
+
+    // Clear session data
+    const sessionCount = sessionMemories.size;
+    sessionMemories.clear();
+    console.log(`Cleared ${sessionCount} sessions from memory.`);
+
+    // Clear weather cache
+    weatherCache = { data: null, timestamp: 0 };
+    console.log('Cleared weather cache.');
+
+    console.log('Graceful shutdown complete.');
+    process.exit(0);
+  });
+
+  // Force shutdown after 10 seconds if graceful shutdown fails
+  setTimeout(() => {
+    console.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
