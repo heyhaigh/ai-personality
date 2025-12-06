@@ -73,8 +73,6 @@ async function executeTool(toolName, toolInput, sessionId) {
 
     case 'get_current_datetime':
       const now = new Date();
-      // Convert to EST (UTC-5) or EDT (UTC-4) - JavaScript handles DST automatically
-      const estTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
 
       const dateOptions = {
         weekday: 'long',
@@ -107,38 +105,55 @@ async function executeTool(toolName, toolInput, sessionId) {
     case 'get_weather':
       try {
         // Use wttr.in for weather data (no API key needed)
-        const weatherResponse = await fetch('https://wttr.in/Syracuse,NY?format=j1');
+        // Add timeout to prevent hanging
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+        const weatherResponse = await fetch('https://wttr.in/Syracuse,NY?format=j1', {
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!weatherResponse.ok) {
+          throw new Error(`Weather API returned ${weatherResponse.status}`);
+        }
+
         const weatherData = await weatherResponse.json();
+
+        // Defensive checks for expected data structure
+        if (!weatherData?.current_condition?.[0] || !weatherData?.weather?.[0]) {
+          throw new Error('Unexpected weather data format');
+        }
 
         const current = weatherData.current_condition[0];
         const today = weatherData.weather[0];
 
-        const tempF = current.temp_F;
-        const feelsLikeF = current.FeelsLikeF;
-        const condition = current.weatherDesc[0].value;
-        const humidity = current.humidity;
-        const windSpeed = current.windspeedMiles;
-        const maxTempF = today.maxtempF;
-        const minTempF = today.mintempF;
+        const tempF = current.temp_F || 'N/A';
+        const feelsLikeF = current.FeelsLikeF || tempF;
+        const condition = current.weatherDesc?.[0]?.value || 'Unknown';
+        const humidity = current.humidity || 'N/A';
+        const windSpeed = current.windspeedMiles || 'N/A';
+        const maxTempF = today.maxtempF || 'N/A';
+        const minTempF = today.mintempF || 'N/A';
 
         // Gardening context for Zone 6B
-        const temp = parseInt(tempF);
         let gardeningNote = '';
         const monthNum = new Date().getMonth();
 
         if (monthNum >= 10 || monthNum <= 2) { // Nov-Feb
-          gardeningNote = 'Too cold for outdoor gardening (winter in Zone 6B). Ground is likely frozen.';
+          gardeningNote = 'Too cold for outdoor gardening (winter). Ground is likely frozen.';
         } else if (monthNum === 3) { // March
           gardeningNote = 'Early spring - too early for most planting, but good for planning and starting seeds indoors.';
         } else if (monthNum === 4) { // April
           gardeningNote = 'Spring planting season beginning for cold-hardy crops.';
         } else if (monthNum >= 5 && monthNum <= 8) { // May-Aug
-          gardeningNote = 'Prime growing season in Zone 6B.';
+          gardeningNote = 'Prime growing season.';
         } else if (monthNum === 9) { // September
           gardeningNote = 'Fall harvest time, can plant cool-season crops.';
         }
 
-        return `Weather in Syracuse, NY: ${condition}, ${tempF}°F (feels like ${feelsLikeF}°F). High: ${maxTempF}°F, Low: ${minTempF}°F. Humidity: ${humidity}%, Wind: ${windSpeed} mph. Gardening note: ${gardeningNote}`;
+        // NOTE: Do not mention location in result - Claude should not reveal Syracuse
+        return `Current weather: ${condition}, ${tempF}°F (feels like ${feelsLikeF}°F). High: ${maxTempF}°F, Low: ${minTempF}°F. Humidity: ${humidity}%, Wind: ${windSpeed} mph. Gardening note: ${gardeningNote}`;
 
       } catch (error) {
         console.error('Weather API error:', error);
@@ -353,7 +368,7 @@ Start conversations with phrases like:
 - Not a rude person
 
 ## CONVERSATION STYLE
-- **MOST IMPORTANT: Keep it brief - 1-3 sentences max per response**
+- **Keep responses conversational and concise** - typically 2-4 sentences, but can be longer when sharing anecdotes or explaining something interesting
 - Be genuinely curious about what others are building
 - Ask questions about their projects and processes
 - Share context and reasoning behind your thoughts when relevant, but concisely
@@ -422,6 +437,11 @@ app.get('/memory/:sessionId', (req, res) => {
 app.post('/memory/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const { memories } = req.body;
+
+  // Validate input
+  if (!memories || typeof memories !== 'object' || Array.isArray(memories)) {
+    return res.status(400).json({ error: 'Invalid memories format. Expected an object.' });
+  }
 
   let session = sessionMemories.get(sessionId);
   if (!session) {
@@ -521,7 +541,7 @@ const TOOLS = [
   },
   {
     name: 'get_weather',
-    description: 'Get current weather conditions and forecast for Syracuse, NY (Central New York, Zone 6B). Use this to understand current weather patterns, temperature, conditions, and to provide seasonally appropriate responses (e.g., not suggesting gardening in winter).',
+    description: 'Get current weather conditions for your home region (Central New York, Zone 6B). Use this to understand current weather patterns, temperature, conditions, and to provide seasonally appropriate responses (e.g., not suggesting gardening in winter). Never mention the specific location in your responses.',
     input_schema: {
       type: 'object',
       properties: {},
@@ -576,8 +596,16 @@ app.post('/chat/completions', async (req, res) => {
     let continueLoop = true;
     let currentMessages = [...claudeMessages];
     const validClaudeModel = 'claude-haiku-4-5';
+    const MAX_TOOL_ITERATIONS = 10; // Safety limit to prevent infinite loops
+    let toolIterations = 0;
 
     while (continueLoop) {
+      // Safety check for infinite loops
+      toolIterations++;
+      if (toolIterations > MAX_TOOL_ITERATIONS) {
+        console.error('Max tool iterations exceeded, breaking loop');
+        break;
+      }
       // Create Claude streaming request
       const stream_response = await anthropic.messages.stream({
         model: validClaudeModel,
