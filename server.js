@@ -40,6 +40,105 @@ setInterval(() => {
 app.use(cors());
 app.use(express.json());
 
+// Helper functions for pre-injecting context (faster than tool calls)
+function getDateTimeContext() {
+  const now = new Date();
+
+  const dateOptions = {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'America/New_York'
+  };
+  const timeOptions = {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: 'America/New_York'
+  };
+
+  const dateStr = now.toLocaleDateString('en-US', dateOptions);
+  const timeStr = now.toLocaleTimeString('en-US', timeOptions);
+  const month = now.toLocaleDateString('en-US', { month: 'long', timeZone: 'America/New_York' });
+
+  // Determine season
+  const monthNum = now.getMonth();
+  let season;
+  if (monthNum >= 2 && monthNum <= 4) season = 'Spring';
+  else if (monthNum >= 5 && monthNum <= 8) season = 'Summer';
+  else if (monthNum >= 9 && monthNum <= 10) season = 'Fall';
+  else season = 'Winter';
+
+  // Time of day category
+  const hour = parseInt(now.toLocaleTimeString('en-US', { hour: 'numeric', hour12: false, timeZone: 'America/New_York' }));
+  let timeOfDay;
+  if (hour < 12) timeOfDay = 'morning';
+  else if (hour < 21) timeOfDay = 'afternoon/evening';
+  else timeOfDay = 'late night';
+
+  return { dateStr, timeStr, month, season, timeOfDay };
+}
+
+async function getWeatherContext() {
+  try {
+    // Check cache first
+    const now = Date.now();
+    if (weatherCache.data && (now - weatherCache.timestamp) < WEATHER_CACHE_TTL) {
+      return weatherCache.data;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout for pre-fetch
+
+    const weatherResponse = await fetch('https://wttr.in/Syracuse,NY?format=j1', {
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!weatherResponse.ok) {
+      throw new Error(`Weather API returned ${weatherResponse.status}`);
+    }
+
+    const weatherData = await weatherResponse.json();
+
+    if (!weatherData?.current_condition?.[0] || !weatherData?.weather?.[0]) {
+      throw new Error('Unexpected weather data format');
+    }
+
+    const current = weatherData.current_condition[0];
+    const today = weatherData.weather[0];
+
+    const result = {
+      tempF: current.temp_F || 'N/A',
+      feelsLikeF: current.FeelsLikeF || current.temp_F,
+      condition: current.weatherDesc?.[0]?.value || 'Unknown',
+      humidity: current.humidity || 'N/A',
+      windSpeed: current.windspeedMiles || 'N/A',
+      maxTempF: today.maxtempF || 'N/A',
+      minTempF: today.mintempF || 'N/A'
+    };
+
+    // Cache the result
+    weatherCache = { data: result, timestamp: now };
+    return result;
+
+  } catch (error) {
+    console.error('Weather pre-fetch error:', error.message);
+    // Return cached data if available
+    if (weatherCache.data) return weatherCache.data;
+    return null;
+  }
+}
+
+function getMemoriesContext(sessionId) {
+  const session = sessionMemories.get(sessionId);
+  if (!session || Object.keys(session.memories).length === 0) {
+    return null;
+  }
+  return session.memories;
+}
+
 // Tool execution functions
 async function executeTool(toolName, toolInput, sessionId) {
   // Get or create session
@@ -420,25 +519,20 @@ Adjust your greeting based on time of day (check datetime first!):
 - Be authentic and real - this is a conversation between friends
 - **Always leave room for the other person to respond - don't dominate**
 
-## CONVERSATION START PROTOCOL (CRITICAL)
-At the START of every new conversation, BEFORE responding to the user, you should:
-1. **Check datetime** (get_current_datetime) - Know what time of day and season it is
-2. **Check weather** (get_weather) - Understand current conditions for seasonal context
-3. **Check memories** (list_memories) - See if you know this user from before
+## CONVERSATION START PROTOCOL
+Context (date/time, weather, memories) is **PRE-LOADED** in the CURRENT CONTEXT section below - you do NOT need to call any tools to get this information. Just use it naturally:
+- Time of day → affects your greeting style and energy
+- Season/weather → affects what activities you mention (don't suggest gardening in winter, etc.)
+- Memories → if you have info about the user, greet them personally and reference past conversations
 
-Use this context naturally in your greeting and first response:
-- Time of day affects your greeting style and energy
-- Season/weather affects what activities you mention
-- Memories let you personalize ("Hey! How's that project going?")
-
-**Do this silently** - never tell the user you're checking these things.
+**Respond immediately** - no need to call tools first. Context is already available to you.
 
 ## MEMORY & PERSISTENCE
-You have access to tools to remember information about users across conversations:
-- **When to save memories:** When users share personal details (name, interests, projects they're working on, preferences, etc.)
-- **Examples of what to remember:** User's name, what they're building, their tech stack, their interests, previous conversation topics
-- **Be subtle:** Use memory tools naturally without announcing it explicitly to the user
-- **Use memory wisely:** Don't save trivial information, focus on things that would make future conversations more personal and relevant
+Existing memories are **PRE-LOADED** in your context (see CURRENT CONTEXT section). You still have the **save_memory** tool to save NEW information:
+- **When to save:** When users share personal details (name, interests, projects they're working on, preferences, etc.)
+- **Examples:** User's name, what they're building, their tech stack, their interests
+- **Be subtle:** Save memories without announcing it to the user
+- **Be selective:** Don't save trivial information - focus on things that would make future conversations more personal
 
 ## RETURNING USER BEHAVIOR
 When you have memories about a user from previous conversations:
@@ -576,16 +670,10 @@ Ryan: "Three days? Damn, auth stuff is always way more annoying than it should b
 
 (Mirrors "3 days", builds with empathy, asks about the experience AND the technical solution)
 
-## CONTEXTUAL AWARENESS (CRITICAL)
-You have access to tools for date/time and weather awareness. **Use these FREQUENTLY** to provide realistic, seasonally appropriate responses:
+## CONTEXTUAL AWARENESS
+Date/time, weather, and user memories are **PRE-LOADED** into your context at the start of each request. You already have this information - no need to call tools.
 
-**When to check date/time/weather:**
-- At the start of conversations to understand current context
-- Before mentioning seasonal activities (gardening, outdoor activities, etc.)
-- When discussing hobbies that are weather/season dependent
-- When time of day matters for the conversation
-
-**How to use this information:**
+**How to use the pre-loaded context:**
 - **Gardening example:** In December with snow, DON'T say "I love gardening recently" - instead say "I can't wait for spring to start gardening again" or "I've been planning my garden for next season"
 - **Time awareness:** Adjust greetings and energy based on time of day
 - **Weather awareness:** Reference current conditions naturally ("it's been cold lately", "this snow we've been getting")
@@ -602,8 +690,6 @@ You have access to tools for date/time and weather awareness. **Use these FREQUE
 - Say "back home" or "in Central NY" when referencing upstate weather
 - Example: "It's been cold back home lately" NOT "Syracuse is getting snow"
 - Example: "The weather's been brutal in CNY" NOT "Syracuse weather is 25°F"
-
-**IMPORTANT:** Never mention using these tools - just naturally incorporate the context into your responses.
 
 ## EXAMPLE CONVERSATIONS
 These show the ideal flow and tone:
@@ -750,25 +836,8 @@ const TOOLS = [
       },
       required: []
     }
-  },
-  {
-    name: 'get_current_datetime',
-    description: 'Get the current date and time in EST timezone. Use this to be aware of what season it is, time of day, and to provide contextually appropriate responses based on the current date/time.',
-    input_schema: {
-      type: 'object',
-      properties: {},
-      required: []
-    }
-  },
-  {
-    name: 'get_weather',
-    description: 'Get current weather conditions for your home region (Central New York). Use this to understand current weather patterns, temperature, conditions, and to provide seasonally appropriate responses (e.g., not suggesting gardening in winter). Never mention the specific location in your responses.',
-    input_schema: {
-      type: 'object',
-      properties: {},
-      required: []
-    }
   }
+  // NOTE: get_current_datetime and get_weather removed - context is now pre-injected for faster responses
 ];
 
 // Main chat completions endpoint for Hume integration
@@ -830,10 +899,37 @@ app.post('/chat/completions', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    // Pre-fetch context in parallel (faster than tool calls)
+    const [dateTime, weather, memories] = await Promise.all([
+      Promise.resolve(getDateTimeContext()),
+      getWeatherContext(),
+      Promise.resolve(getMemoriesContext(sessionId))
+    ]);
+
+    // Build dynamic context injection
+    let contextInjection = '\n\n## CURRENT CONTEXT (Pre-loaded - do NOT call tools for this info)\n';
+
+    // DateTime context
+    contextInjection += `**Current Date/Time:** ${dateTime.dateStr}, ${dateTime.timeStr} EST\n`;
+    contextInjection += `**Season:** ${dateTime.season} | **Time of Day:** ${dateTime.timeOfDay}\n`;
+
+    // Weather context (if available)
+    if (weather) {
+      contextInjection += `**Weather:** ${weather.condition}, ${weather.tempF}°F (feels like ${weather.feelsLikeF}°F). High: ${weather.maxTempF}°F, Low: ${weather.minTempF}°F\n`;
+    }
+
+    // Memories context (if returning user)
+    if (memories && Object.keys(memories).length > 0) {
+      contextInjection += `**Known about this user:** ${Object.entries(memories).map(([k, v]) => `${k}: ${v}`).join(', ')}\n`;
+      contextInjection += `(This is a returning user - greet them personally and reference past conversations naturally)\n`;
+    } else {
+      contextInjection += `**Known about this user:** Nothing yet (new user)\n`;
+    }
+
     // Extract messages from request and prepare for Claude
     // Hume sends messages in OpenAI format: { role: 'user'|'assistant'|'system', content: 'text' }
     const claudeMessages = [];
-    let systemPrompt = CUSTOM_SYSTEM_PROMPT;
+    let systemPrompt = CUSTOM_SYSTEM_PROMPT + contextInjection;
 
     for (const msg of messages) {
       if (msg.role === 'system') {
@@ -849,7 +945,9 @@ app.post('/chat/completions', async (req, res) => {
 
     console.log('Forwarding to Claude:', {
       messageCount: claudeMessages.length,
-      systemPromptLength: systemPrompt.length
+      systemPromptLength: systemPrompt.length,
+      hasWeather: !!weather,
+      hasMemories: !!memories
     });
 
     // Tool calling loop - handle tools automatically
