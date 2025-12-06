@@ -34,7 +34,7 @@ app.use(cors());
 app.use(express.json());
 
 // Tool execution functions
-function executeTool(toolName, toolInput, sessionId) {
+async function executeTool(toolName, toolInput, sessionId) {
   // Get or create session
   let session = sessionMemories.get(sessionId);
   if (!session) {
@@ -69,6 +69,80 @@ function executeTool(toolName, toolInput, sessionId) {
       } else {
         session.memories = {};
         return 'All memories cleared.';
+      }
+
+    case 'get_current_datetime':
+      const now = new Date();
+      // Convert to EST (UTC-5) or EDT (UTC-4) - JavaScript handles DST automatically
+      const estTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+
+      const dateOptions = {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        timeZone: 'America/New_York'
+      };
+      const timeOptions = {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'America/New_York'
+      };
+
+      const dateStr = now.toLocaleDateString('en-US', dateOptions);
+      const timeStr = now.toLocaleTimeString('en-US', timeOptions);
+      const month = now.toLocaleDateString('en-US', { month: 'long', timeZone: 'America/New_York' });
+
+      // Determine season for Central NY
+      const monthNum = now.getMonth(); // 0-11
+      let season;
+      if (monthNum >= 2 && monthNum <= 4) season = 'Spring';
+      else if (monthNum >= 5 && monthNum <= 8) season = 'Summer';
+      else if (monthNum >= 9 && monthNum <= 10) season = 'Fall';
+      else season = 'Winter';
+
+      return `Current date/time: ${dateStr}, ${timeStr} EST. Season: ${season}. Month: ${month}.`;
+
+    case 'get_weather':
+      try {
+        // Use wttr.in for weather data (no API key needed)
+        const weatherResponse = await fetch('https://wttr.in/Syracuse,NY?format=j1');
+        const weatherData = await weatherResponse.json();
+
+        const current = weatherData.current_condition[0];
+        const today = weatherData.weather[0];
+
+        const tempF = current.temp_F;
+        const feelsLikeF = current.FeelsLikeF;
+        const condition = current.weatherDesc[0].value;
+        const humidity = current.humidity;
+        const windSpeed = current.windspeedMiles;
+        const maxTempF = today.maxtempF;
+        const minTempF = today.mintempF;
+
+        // Gardening context for Zone 6B
+        const temp = parseInt(tempF);
+        let gardeningNote = '';
+        const monthNum = new Date().getMonth();
+
+        if (monthNum >= 10 || monthNum <= 2) { // Nov-Feb
+          gardeningNote = 'Too cold for outdoor gardening (winter in Zone 6B). Ground is likely frozen.';
+        } else if (monthNum === 3) { // March
+          gardeningNote = 'Early spring - too early for most planting, but good for planning and starting seeds indoors.';
+        } else if (monthNum === 4) { // April
+          gardeningNote = 'Spring planting season beginning for cold-hardy crops.';
+        } else if (monthNum >= 5 && monthNum <= 8) { // May-Aug
+          gardeningNote = 'Prime growing season in Zone 6B.';
+        } else if (monthNum === 9) { // September
+          gardeningNote = 'Fall harvest time, can plant cool-season crops.';
+        }
+
+        return `Weather in Syracuse, NY: ${condition}, ${tempF}°F (feels like ${feelsLikeF}°F). High: ${maxTempF}°F, Low: ${minTempF}°F. Humidity: ${humidity}%, Wind: ${windSpeed} mph. Gardening note: ${gardeningNote}`;
+
+      } catch (error) {
+        console.error('Weather API error:', error);
+        return 'Unable to fetch current weather data.';
       }
 
     default:
@@ -293,6 +367,28 @@ You have access to tools to remember information about users across conversation
 - **Remember context:** At the start of conversations, check if you have memories about the user to personalize the interaction
 - **Use memory wisely:** Don't save trivial information, focus on things that would make future conversations more personal and relevant
 
+## CONTEXTUAL AWARENESS (CRITICAL)
+You have access to tools for date/time and weather awareness. **Use these FREQUENTLY** to provide realistic, seasonally appropriate responses:
+
+**When to check date/time/weather:**
+- At the start of conversations to understand current context
+- Before mentioning seasonal activities (gardening, outdoor activities, etc.)
+- When discussing hobbies that are weather/season dependent
+- When time of day matters for the conversation
+
+**How to use this information:**
+- **Gardening example:** In December with snow, DON'T say "I love gardening recently" - instead say "I can't wait for spring to start gardening again" or "I've been planning my garden for next season"
+- **Time awareness:** Adjust greetings and energy based on time of day
+- **Weather awareness:** Reference current conditions naturally ("it's been cold lately", "this snow we've been getting")
+- **Seasonal context:** Align activities with the season (winter = indoor projects, summer = outdoor activities)
+
+**Location context:**
+- You live in NYC/Jersey City area now
+- You're FROM Central NY (Rochester/Buffalo area) - still care about CNY weather for context
+- Weather tool provides Syracuse, NY (Central NY, Zone 6B) conditions
+
+**IMPORTANT:** Never mention using these tools - just naturally incorporate the context into your responses.
+
 Remember: You're Ryan having a real conversation. Be yourself - curious, friendly, even-toned, opinionated but not confrontational, and genuinely interested in the other person. Most importantly: keep responses SHORT and give people space to talk.`;
 
 // Health check endpoint
@@ -403,6 +499,24 @@ const TOOLS = [
       },
       required: []
     }
+  },
+  {
+    name: 'get_current_datetime',
+    description: 'Get the current date and time in EST timezone. Use this to be aware of what season it is, time of day, and to provide contextually appropriate responses based on the current date/time.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'get_weather',
+    description: 'Get current weather conditions and forecast for Syracuse, NY (Central New York, Zone 6B). Use this to understand current weather patterns, temperature, conditions, and to provide seasonally appropriate responses (e.g., not suggesting gardening in winter).',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
   }
 ];
 
@@ -476,7 +590,7 @@ app.post('/chat/completions', async (req, res) => {
         for (const content of finalMessage.content) {
           if (content.type === 'tool_use') {
             console.log(`Executing tool: ${content.name}`, content.input);
-            const result = executeTool(content.name, content.input, sessionId);
+            const result = await executeTool(content.name, content.input, sessionId);
             toolResults.push({
               type: 'tool_result',
               tool_use_id: content.id,
