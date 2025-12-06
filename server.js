@@ -80,55 +80,63 @@ function getDateTimeContext() {
   return { dateStr, timeStr, month, season, timeOfDay };
 }
 
-async function getWeatherContext() {
-  try {
-    // Check cache first
-    const now = Date.now();
-    if (weatherCache.data && (now - weatherCache.timestamp) < WEATHER_CACHE_TTL) {
-      return weatherCache.data;
-    }
+// Non-blocking weather - returns cache immediately, refreshes in background
+function getWeatherContext() {
+  const now = Date.now();
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout for pre-fetch
+  // Always return cache immediately if available (even if stale)
+  const cachedData = weatherCache.data;
 
-    const weatherResponse = await fetch('https://wttr.in/Syracuse,NY?format=j1', {
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-
-    if (!weatherResponse.ok) {
-      throw new Error(`Weather API returned ${weatherResponse.status}`);
-    }
-
-    const weatherData = await weatherResponse.json();
-
-    if (!weatherData?.current_condition?.[0] || !weatherData?.weather?.[0]) {
-      throw new Error('Unexpected weather data format');
-    }
-
-    const current = weatherData.current_condition[0];
-    const today = weatherData.weather[0];
-
-    const result = {
-      tempF: current.temp_F || 'N/A',
-      feelsLikeF: current.FeelsLikeF || current.temp_F,
-      condition: current.weatherDesc?.[0]?.value || 'Unknown',
-      humidity: current.humidity || 'N/A',
-      windSpeed: current.windspeedMiles || 'N/A',
-      maxTempF: today.maxtempF || 'N/A',
-      minTempF: today.mintempF || 'N/A'
-    };
-
-    // Cache the result
-    weatherCache = { data: result, timestamp: now };
-    return result;
-
-  } catch (error) {
-    console.error('Weather pre-fetch error:', error.message);
-    // Return cached data if available
-    if (weatherCache.data) return weatherCache.data;
-    return null;
+  // If cache is stale or empty, trigger background refresh (don't wait)
+  if (!weatherCache.data || (now - weatherCache.timestamp) >= WEATHER_CACHE_TTL) {
+    refreshWeatherInBackground();
   }
+
+  return cachedData; // Returns immediately (may be null on first call)
+}
+
+// Background weather refresh - doesn't block request
+function refreshWeatherInBackground() {
+  // Don't start multiple refreshes
+  if (weatherCache.refreshing) return;
+  weatherCache.refreshing = true;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+  fetch('https://wttr.in/Syracuse,NY?format=j1', { signal: controller.signal })
+    .then(response => {
+      clearTimeout(timeoutId);
+      if (!response.ok) throw new Error(`Weather API returned ${response.status}`);
+      return response.json();
+    })
+    .then(weatherData => {
+      if (!weatherData?.current_condition?.[0] || !weatherData?.weather?.[0]) {
+        throw new Error('Unexpected weather data format');
+      }
+
+      const current = weatherData.current_condition[0];
+      const today = weatherData.weather[0];
+
+      weatherCache = {
+        data: {
+          tempF: current.temp_F || 'N/A',
+          feelsLikeF: current.FeelsLikeF || current.temp_F,
+          condition: current.weatherDesc?.[0]?.value || 'Unknown',
+          humidity: current.humidity || 'N/A',
+          windSpeed: current.windspeedMiles || 'N/A',
+          maxTempF: today.maxtempF || 'N/A',
+          minTempF: today.mintempF || 'N/A'
+        },
+        timestamp: Date.now(),
+        refreshing: false
+      };
+      console.log('Weather cache refreshed in background');
+    })
+    .catch(error => {
+      console.error('Background weather refresh error:', error.message);
+      weatherCache.refreshing = false;
+    });
 }
 
 function getMemoriesContext(sessionId) {
@@ -899,12 +907,10 @@ app.post('/chat/completions', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Pre-fetch context in parallel (faster than tool calls)
-    const [dateTime, weather, memories] = await Promise.all([
-      Promise.resolve(getDateTimeContext()),
-      getWeatherContext(),
-      Promise.resolve(getMemoriesContext(sessionId))
-    ]);
+    // Get context synchronously (no blocking - weather uses cache)
+    const dateTime = getDateTimeContext();
+    const weather = getWeatherContext(); // Returns cache immediately, refreshes in background
+    const memories = getMemoriesContext(sessionId);
 
     // Build dynamic context injection
     let contextInjection = '\n\n## CURRENT CONTEXT (Pre-loaded - do NOT call tools for this info)\n';
@@ -967,7 +973,7 @@ app.post('/chat/completions', async (req, res) => {
       // Create Claude streaming request
       const stream_response = await anthropic.messages.stream({
         model: validClaudeModel,
-        max_tokens: 1000,
+        max_tokens: 300, // Reduced for faster generation - responses should be short anyway
         system: systemPrompt,
         messages: currentMessages,
         tools: TOOLS,
